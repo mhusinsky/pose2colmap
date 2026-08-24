@@ -79,6 +79,10 @@ Metashape Reference pane import CSV format:
     DSC_0001.jpg,0.0,0.0,0.0,0.0,0.0,0.0
     DSC_0002.jpg,0.1,0.0,0.0,0.0,0.0,0.0
 
+colmap_txt_converter_py
+=======================
+GUI for sparse files from XGRIDS Developer_data conversion from .bin to .txt
+
 
      
 
