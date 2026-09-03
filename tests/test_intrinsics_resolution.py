@@ -32,6 +32,12 @@ class ResolveIntrinsicsTests(unittest.TestCase):
         txt.write_text(self.matrix_txt, encoding="utf-8")
         return load_intrinsic_txt(str(txt))
 
+    def test_matrix_parser_rejects_non_intrinsic_triples(self):
+        with tempfile.TemporaryDirectory() as td:
+            txt = Path(td) / "left_undistort_intrinsic.txt"
+            txt.write_text("1 2 3\n4 5 6\n7 8 9\n", encoding="utf-8")
+            self.assertEqual(load_intrinsic_txt(str(txt)), {})
+
     def test_matrix_txt_selected_over_opt_and_json_with_alias_dims(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)

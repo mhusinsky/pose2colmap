@@ -882,10 +882,18 @@ def load_intrinsic_txt(path):
             matrix_rows.append(floats)
 
     if len(matrix_rows) >= 3:
-        vals.setdefault("fx", matrix_rows[0][0])
-        vals.setdefault("cx", matrix_rows[0][2])
-        vals.setdefault("fy", matrix_rows[1][1])
-        vals.setdefault("cy", matrix_rows[1][2])
+        r0, r1, r2 = matrix_rows[0], matrix_rows[1], matrix_rows[2]
+        eps = 1e-6
+        if (r0[0] > 0 and r1[1] > 0
+                and abs(r0[1]) <= eps
+                and abs(r1[0]) <= eps
+                and abs(r2[0]) <= eps
+                and abs(r2[1]) <= eps
+                and abs(r2[2] - 1.0) <= 1e-3):
+            vals.setdefault("fx", r0[0])
+            vals.setdefault("cx", r0[2])
+            vals.setdefault("fy", r1[1])
+            vals.setdefault("cy", r1[2])
 
     # Try single-line: fx fy cx cy
     for line in raw.strip().splitlines():
@@ -988,7 +996,7 @@ def _read_image_size(path):
                     f.seek(seg_len - 2, os.SEEK_CUR)
             if len(sig) >= 26 and sig.startswith(b"BM"):
                 w = struct.unpack("<I", sig[18:22])[0]
-                h = struct.unpack("<I", sig[22:26])[0]
+                h = struct.unpack("<i", sig[22:26])[0]
                 return int(w), int(abs(h))
     except OSError:
         return 0, 0
@@ -1183,7 +1191,7 @@ def print_discovery(files):
 # Intrinsics resolution
 # -----------------------------------------------------------------------------
 
-def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fisheye=False, yaml_cal=None, viewer_conventions="RS2", metashape_ms=None, image_dir=None):
+def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fisheye=False, yaml_cal=None, viewer_conventions="RS2", metashape_ms=None, *, image_dir=None):
     """
     Resolve camera intrinsics from available sources (in priority order):
       1. *_undistort_intrinsic.txt (post-undistort fx, fy, cx, cy in pixels)
