@@ -45,7 +45,7 @@ Auto-discovered files (PCS naming convention):
   ImgPose.txt                  -?position + roll/pitch/yaw + quaternion + timestamp
   xyzopt.txt / xyzopk.txt       -?position + Omega/Phi/Kappa (photogrammetry angles)
 
-Intrinsics priority: TransformedCam.json -?*_intrinsic.txt -?*.opt
+Intrinsics priority (non-fisheye): *_intrinsic.txt -> *.opt -> TransformedCam.json
 
 Usage:
   # Auto-discover mode (recommended --point to undistort folder)
@@ -73,6 +73,7 @@ import sys
 import glob
 import shutil
 import argparse
+import struct
 import yaml
 import xml.etree.ElementTree as ET
 import numpy as np
@@ -866,6 +867,34 @@ def load_intrinsic_txt(path):
                 vals["w"] = int(floats[4])
                 vals["h"] = int(floats[5])
 
+    # Try standard 3x3 row-major intrinsic matrix:
+    # fx 0 cx
+    # 0 fy cy
+    # 0 0 1
+    matrix_rows = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" in line:
+            continue
+        parts = line.replace(",", " ").replace("\t", " ").split()
+        floats = [float(p) for p in parts if _is_float(p)]
+        if len(parts) == 3 and len(floats) == 3:
+            matrix_rows.append(floats)
+
+    if len(matrix_rows) >= 3:
+        r0, r1, r2 = matrix_rows[0], matrix_rows[1], matrix_rows[2]
+        eps = 1e-6
+        if (r0[0] > 0 and r1[1] > 0
+                and abs(r0[1]) <= eps
+                and abs(r1[0]) <= eps
+                and abs(r2[0]) <= eps
+                and abs(r2[1]) <= eps
+                and abs(r2[2] - 1.0) <= 1e-3):
+            vals.setdefault("fx", r0[0])
+            vals.setdefault("cx", r0[2])
+            vals.setdefault("fy", r1[1])
+            vals.setdefault("cy", r1[2])
+
     # Try single-line: fx fy cx cy
     for line in raw.strip().splitlines():
         line = line.strip()
@@ -898,6 +927,126 @@ def _is_float(s):
         return True
     except ValueError:
         return False
+
+
+def _to_positive_int(value):
+    try:
+        v = int(float(value))
+        return v if v > 0 else 0
+    except (TypeError, ValueError):
+        return 0
+
+
+def _extract_dims_from_mapping(mapping):
+    if not isinstance(mapping, dict):
+        return 0, 0
+    w_keys = ("w", "width", "image_width", "imageWidth", "img_width", "W")
+    h_keys = ("h", "height", "image_height", "imageHeight", "img_height", "H")
+    w = 0
+    h = 0
+    for k in w_keys:
+        w = _to_positive_int(mapping.get(k))
+        if w:
+            break
+    for k in h_keys:
+        h = _to_positive_int(mapping.get(k))
+        if h:
+            break
+    return w, h
+
+
+def _read_image_size(path):
+    """
+    Return image dimensions as (w, h) for PNG/JPEG/BMP, else (0, 0).
+    """
+    try:
+        with open(path, "rb") as f:
+            sig = f.read(24)
+            if len(sig) >= 24 and sig.startswith(b"\x89PNG\r\n\x1a\n"):
+                w, h = struct.unpack(">II", sig[16:24])
+                return int(w), int(h)
+            if len(sig) >= 2 and sig[0:2] == b"\xff\xd8":
+                f.seek(2)
+                while True:
+                    b = f.read(1)
+                    if not b:
+                        break
+                    if b != b"\xff":
+                        continue
+                    marker = f.read(1)
+                    while marker == b"\xff":
+                        marker = f.read(1)
+                    if not marker:
+                        break
+                    m = marker[0]
+                    if m in (0xD8, 0xD9):
+                        continue
+                    seg_len_raw = f.read(2)
+                    if len(seg_len_raw) != 2:
+                        break
+                    seg_len = struct.unpack(">H", seg_len_raw)[0]
+                    if seg_len < 2:
+                        break
+                    if 0xC0 <= m <= 0xCF and m not in (0xC4, 0xC8, 0xCC):
+                        sof = f.read(5)
+                        if len(sof) == 5:
+                            h, w = struct.unpack(">HH", sof[1:5])
+                            return int(w), int(h)
+                        break
+                    f.seek(seg_len - 2, os.SEEK_CUR)
+            if len(sig) >= 26 and sig.startswith(b"BM"):
+                w = struct.unpack("<I", sig[18:22])[0]
+                h = struct.unpack("<i", sig[22:26])[0]
+                return int(w), int(abs(h))
+    except OSError:
+        return 0, 0
+    return 0, 0
+
+
+def _find_dims_from_images(frames, image_dir):
+    if not image_dir:
+        return 0, 0
+    image_dir = Path(image_dir)
+    if not image_dir.exists():
+        return 0, 0
+    side_name = image_dir.name.lower()
+    parent_dir = image_dir.parent
+    for fr in frames:
+        fp = fr.get("file_path", "")
+        if not fp:
+            continue
+        norm = fp.replace("\\", "/")
+        p = Path(norm)
+        rel = p
+        if p.parts and p.parts[0].lower() == side_name:
+            rel = Path(*p.parts[1:]) if len(p.parts) > 1 else Path(p.name)
+        candidates = [
+            image_dir / rel,
+            image_dir / p.name,
+            parent_dir / norm,
+        ]
+        if p.is_absolute():
+            candidates.insert(0, p)
+        for cand in candidates:
+            if cand.exists() and cand.is_file():
+                w, h = _read_image_size(cand)
+                if w and h:
+                    return w, h
+    return 0, 0
+
+
+def _resolve_txt_dimensions(intrinsic_txt_params, frames, image_dir):
+    w, h = _extract_dims_from_mapping(intrinsic_txt_params)
+    if w and h:
+        return w, h, "intrinsic.txt"
+    for fr in frames:
+        w, h = _extract_dims_from_mapping(fr)
+        if w and h:
+            return w, h, "frame metadata"
+    w, h = _find_dims_from_images(frames, image_dir)
+    if w and h:
+        return w, h, "image files"
+    return 0, 0, None
 
 
 def load_imgpose(path):
@@ -1042,12 +1191,12 @@ def print_discovery(files):
 # Intrinsics resolution
 # -----------------------------------------------------------------------------
 
-def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fisheye=False, yaml_cal=None, viewer_conventions="RS2", metashape_ms=None):
+def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fisheye=False, yaml_cal=None, viewer_conventions="RS2", metashape_ms=None, *, image_dir=None):
     """
     Resolve camera intrinsics from available sources (in priority order):
-      1. TransformedCam.json frame data (fl_x, cx, cy, w, h, distortion coeffs)
-      2. *_undistort_intrinsic.txt (post-undistort fx, fy, cx, cy in pixels)
-      3. *.opt file (mm focal length -?pixel conversion via sensor width)
+      1. *_undistort_intrinsic.txt (post-undistort fx, fy, cx, cy in pixels)
+      2. *.opt file (mm focal length -> pixel conversion via sensor width)
+      3. TransformedCam.json frame data (fl_x, cx, cy, w, h, distortion coeffs)
 
     Returns: (model, fx, fy, cx, cy, k1, k2, p1, p2, k3, w, h)
     """
@@ -1132,47 +1281,37 @@ def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fi
                   f"(k1={k1:.4f}, k2={k2:.4f}, k3={k3:.4f}, k4={k4:.4f}, p1=p2=k5=k6=0)")
             return model, fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, k5, k6, w, h
 
-    # -- 1. From JSON frame --------------------------------------------
-    for fr in frames:
-        if fr.get("fl_x", 0) != 0 and fr.get("w", 0) != 0:
-            w, h   = int(fr["w"]), int(fr["h"])
-            fx, fy = fr["fl_x"], fr.get("fl_y", fr["fl_x"])
-            cx, cy = fr["cx"], fr["cy"]
-            k1 = fr.get("k1", 0.0); k2 = fr.get("k2", 0.0)
-            k3 = fr.get("k3", 0.0)
-            p1 = fr.get("p1", 0.0); p2 = fr.get("p2", 0.0)
-            model = "FULL_OPENCV"
-            print(f"  [{label}] Intrinsics from JSON  : {w}x{h}, "
-                  f"fx={fx:.2f}, fy={fy:.2f}, model=FULL_OPENCV")
-            return model, fx, fy, cx, cy, k1, k2, p1, p2, k3, 0.0, 0.0, 0.0, w, h
+    # -- 1. From intrinsic.txt (preferred non-fisheye source) ------------------
     if intrinsic_txt_params and "fx" in intrinsic_txt_params:
-        w = int(intrinsic_txt_params.get("w", 0))
-        h = int(intrinsic_txt_params.get("h", 0))
-        # Try to get dimensions from a frame if not in txt
-        if w == 0 or h == 0:
-            for fr in frames:
-                if fr.get("w", 0) and fr.get("h", 0):
-                    w = int(fr["w"]); h = int(fr["h"]); break
-        if w and h:
-            fx = intrinsic_txt_params["fx"]
-            fy = intrinsic_txt_params.get("fy", fx)
-            cx = intrinsic_txt_params.get("cx", w / 2.0)
-            cy = intrinsic_txt_params.get("cy", h / 2.0)
-            model = "SIMPLE_PINHOLE"
-            print(f"  [{label}] Intrinsics from txt   : {w}x{h}, "
-                  f"fx={fx:.2f}, fy={fy:.2f}, model=SIMPLE_PINHOLE")
-            return model, fx, fy, cx, cy, 0.0, 0.0, 0.0, 0.0, 0.0, w, h
+        w, h, src = _resolve_txt_dimensions(intrinsic_txt_params, frames, image_dir)
+        if not (w and h):
+            raise ValueError(
+                f"[{label}] Parsed intrinsic TXT values (fx/fy/cx/cy) but could not determine "
+                "undistorted image dimensions from intrinsic.txt fields, frame metadata "
+                "(w/h, width/height, imageWidth/imageHeight), or image files. "
+                "Refusing to fall back to .opt because .opt describes pre-undistortion calibration."
+            )
+        fx = intrinsic_txt_params["fx"]
+        fy = intrinsic_txt_params.get("fy", fx)
+        cx = intrinsic_txt_params.get("cx", w / 2.0)
+        cy = intrinsic_txt_params.get("cy", h / 2.0)
+        model = "PINHOLE"
+        print(f"  [{label}] Intrinsics from txt   : {w}x{h}, "
+              f"fx={fx:.2f}, fy={fy:.2f}, cx={cx:.2f}, cy={cy:.2f}, model=PINHOLE (dims from {src})")
+        return model, fx, fy, cx, cy, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, w, h
 
-    # -- 3. From .opt file ----------------------------------------------------
+    # -- 2. From .opt file -----------------------------------------------------
     if opt_params and "FocalLength" in opt_params and "SensorSize" in opt_params:
         fl_mm  = opt_params["FocalLength"]
         sensor = opt_params["SensorSize"]
-        w = int(opt_params.get("ImageWidth",  0))
-        h = int(opt_params.get("ImageHeight", 0))
+        w = _to_positive_int(opt_params.get("ImageWidth",  0))
+        h = _to_positive_int(opt_params.get("ImageHeight", 0))
         if w == 0 or h == 0:
             for fr in frames:
-                if fr.get("w", 0) and fr.get("h", 0):
-                    w = int(fr["w"]); h = int(fr["h"]); break
+                fw, fh = _extract_dims_from_mapping(fr)
+                if fw and fh:
+                    w, h = fw, fh
+                    break
         if w and h:
             px_per_mm = w / sensor
             fx = fy = fl_mm * px_per_mm
@@ -1194,6 +1333,19 @@ def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fi
                   f"fx={fx:.2f} px  (fl={fl_mm}mm, sensor={sensor}mm)"
                   f"{', model=FULL_OPENCV (distortion)' if has_distortion else ''}")
             return model, fx, fy, cx, cy, k1, k2, p1, p2, k3, 0.0, 0.0, 0.0, w, h
+    # -- 3. From JSON frame ----------------------------------------------------
+    for fr in frames:
+        w, h = _extract_dims_from_mapping(fr)
+        if fr.get("fl_x", 0) != 0 and w and h:
+            fx, fy = fr["fl_x"], fr.get("fl_y", fr["fl_x"])
+            cx, cy = fr["cx"], fr["cy"]
+            k1 = fr.get("k1", 0.0); k2 = fr.get("k2", 0.0)
+            k3 = fr.get("k3", 0.0)
+            p1 = fr.get("p1", 0.0); p2 = fr.get("p2", 0.0)
+            model = "FULL_OPENCV"
+            print(f"  [{label}] Intrinsics from JSON  : {w}x{h}, "
+                  f"fx={fx:.2f}, fy={fy:.2f}, model=FULL_OPENCV")
+            return model, fx, fy, cx, cy, k1, k2, p1, p2, k3, 0.0, 0.0, 0.0, w, h
     print(f"       JSON frames: {len(frames)}, first has fl_x={frames[0].get('fl_x',0)}")
     print(f"       intrinsic.txt: {intrinsic_txt_params}")
     print(f"       .opt file: {dict(opt_params) if opt_params else 'not found'}")
@@ -1210,6 +1362,8 @@ def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fi
 
 def cameras_line(cam_id, model, w, h, fx, fy, cx, cy, k1, k2, p1, p2, k3, k4=None, k5=0.0, k6=0.0):
     """One cameras.txt entry."""
+    if model == "PINHOLE":
+        return f"{cam_id} {model} {w} {h} {fx:.8f} {fy:.8f} {cx:.8f} {cy:.8f}\n"
     if model == "SIMPLE_PINHOLE":
         return f"{cam_id} {model} {w} {h} {fx:.8f} {cx:.8f} {cy:.8f}\n"
     elif model == "SIMPLE_RADIAL":
@@ -1233,7 +1387,7 @@ def cameras_line(cam_id, model, w, h, fx, fy, cx, cy, k1, k2, p1, p2, k3, k4=Non
         return (f"{cam_id} {model} {w} {h} {fx:.8f} {fy:.8f} {cx:.8f} {cy:.8f} "
                 f"{k1:.8f} {k2:.8f} {k3:.8f} {k4_val:.8f}\n")
     else:
-        return f"{cam_id} PINHOLE {w} {h} {fx:.8f} {cx:.8f} {cy:.8f}\n"
+        return f"{cam_id} PINHOLE {w} {h} {fx:.8f} {fy:.8f} {cx:.8f} {cy:.8f}\n"
 
 
 def images_line(img_id, cam_id, name, qw, qx, qy, qz, tx, ty, tz):
@@ -1655,8 +1809,8 @@ def convert(folder=None,
     left_cal  = get_c1_hardcoded_calibration("left", viewer_conventions)
     right_cal = get_c1_hardcoded_calibration("right", viewer_conventions)
     print(f"  Using hardcoded C1 calibration (Metashape XML overrides this if provided; viewer={viewer_conventions})")
-    left_intr  = resolve_intrinsics(left_frames,  intr_l, opt_l, label="left",  fisheye=fisheye, yaml_cal=left_cal,  viewer_conventions=viewer_conventions, metashape_ms=ms_left_xml)
-    right_intr = resolve_intrinsics(right_frames, intr_r, opt_r, label="right", fisheye=fisheye, yaml_cal=right_cal, viewer_conventions=viewer_conventions, metashape_ms=ms_right_xml)
+    left_intr  = resolve_intrinsics(left_frames,  intr_l, opt_l, label="left",  fisheye=fisheye, yaml_cal=left_cal,  viewer_conventions=viewer_conventions, metashape_ms=ms_left_xml, image_dir=folder / "left")
+    right_intr = resolve_intrinsics(right_frames, intr_r, opt_r, label="right", fisheye=fisheye, yaml_cal=right_cal, viewer_conventions=viewer_conventions, metashape_ms=ms_right_xml, image_dir=folder / "right")
 
     # -- Write cameras.txt (per-image PINHOLE mode) ------------------------
     # v20: one PINHOLE camera per image (CAMERA_ID == IMAGE_ID, 1:1 mapping)
