@@ -45,7 +45,7 @@ Auto-discovered files (PCS naming convention):
   ImgPose.txt                  -?position + roll/pitch/yaw + quaternion + timestamp
   xyzopt.txt / xyzopk.txt       -?position + Omega/Phi/Kappa (photogrammetry angles)
 
-Intrinsics priority: TransformedCam.json -?*_intrinsic.txt -?*.opt
+Intrinsics priority: *_intrinsic.txt -?*.opt -?TransformedCam.json
 
 Usage:
   # Auto-discover mode (recommended --point to undistort folder)
@@ -825,6 +825,7 @@ def load_intrinsic_txt(path):
     Parse *_undistort_intrinsic.txt (post-undistortion pixel intrinsics).
     Handles common formats:
       - key=value pairs:  fx = 1423.5
+      - 3x3 matrix:       fx  0  cx / 0  fy  cy / 0   0   1
       - tab/space cols:   fx    fy    cx    cy
       - single-line:      fx fy cx cy
     Returns: {fx, fy, cx, cy, w, h} or {} on failure.
@@ -850,12 +851,28 @@ def load_intrinsic_txt(path):
                 except ValueError:
                     pass
 
+    # Try a standard row-major 3x3 intrinsic matrix.
+    matrix_rows = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" in line:
+            continue
+        parts = line.replace(",", " ").replace("\t", " ").split()
+        floats = [float(p) for p in parts if _is_float(p)]
+        if len(parts) == 3 and len(floats) == 3:
+            matrix_rows.append(floats)
+    if len(matrix_rows) >= 3:
+        vals.setdefault("fx", matrix_rows[0][0])
+        vals.setdefault("cx", matrix_rows[0][2])
+        vals.setdefault("fy", matrix_rows[1][1])
+        vals.setdefault("cy", matrix_rows[1][2])
+
     # Try space/tab separated columns (first 4+ floats)
     for line in raw.strip().splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" in line:
             continue
-        parts = line.replace("\t", " ").split()
+        parts = line.replace(",", " ").replace("\t", " ").split()
         floats = [float(p) for p in parts if _is_float(p)]
         if len(floats) >= 4:
             keys = ["fx", "fy", "cx", "cy"]
@@ -871,7 +888,7 @@ def load_intrinsic_txt(path):
         line = line.strip()
         if not line or line.startswith("#"):
             continue
-        parts = line.split()
+        parts = line.replace(",", " ").split()
         floats = [float(p) for p in parts if _is_float(p)]
         if len(floats) == 4 and floats[0] > 100 and floats[1] > 100:
             # Likely fx fy cx cy in pixels
@@ -1045,11 +1062,11 @@ def print_discovery(files):
 def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fisheye=False, yaml_cal=None, viewer_conventions="RS2", metashape_ms=None):
     """
     Resolve camera intrinsics from available sources (in priority order):
-      1. TransformedCam.json frame data (fl_x, cx, cy, w, h, distortion coeffs)
-      2. *_undistort_intrinsic.txt (post-undistort fx, fy, cx, cy in pixels)
-      3. *.opt file (mm focal length -?pixel conversion via sensor width)
+      1. *_undistort_intrinsic.txt (post-undistort fx, fy, cx, cy in pixels)
+      2. *.opt file (mm focal length -?pixel conversion via sensor width)
+      3. TransformedCam.json frame data (fl_x, cx, cy, w, h, distortion coeffs)
 
-    Returns: (model, fx, fy, cx, cy, k1, k2, p1, p2, k3, w, h)
+    Returns: (model, fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, k5, k6, w, h)
     """
     # -- 0. Fisheye from .opt (check FIRST when fisheye flag set) --------
     if fisheye:
@@ -1132,19 +1149,6 @@ def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fi
                   f"(k1={k1:.4f}, k2={k2:.4f}, k3={k3:.4f}, k4={k4:.4f}, p1=p2=k5=k6=0)")
             return model, fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, k5, k6, w, h
 
-    # -- 1. From JSON frame --------------------------------------------
-    for fr in frames:
-        if fr.get("fl_x", 0) != 0 and fr.get("w", 0) != 0:
-            w, h   = int(fr["w"]), int(fr["h"])
-            fx, fy = fr["fl_x"], fr.get("fl_y", fr["fl_x"])
-            cx, cy = fr["cx"], fr["cy"]
-            k1 = fr.get("k1", 0.0); k2 = fr.get("k2", 0.0)
-            k3 = fr.get("k3", 0.0)
-            p1 = fr.get("p1", 0.0); p2 = fr.get("p2", 0.0)
-            model = "FULL_OPENCV"
-            print(f"  [{label}] Intrinsics from JSON  : {w}x{h}, "
-                  f"fx={fx:.2f}, fy={fy:.2f}, model=FULL_OPENCV")
-            return model, fx, fy, cx, cy, k1, k2, p1, p2, k3, 0.0, 0.0, 0.0, w, h
     if intrinsic_txt_params and "fx" in intrinsic_txt_params:
         w = int(intrinsic_txt_params.get("w", 0))
         h = int(intrinsic_txt_params.get("h", 0))
@@ -1158,12 +1162,12 @@ def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fi
             fy = intrinsic_txt_params.get("fy", fx)
             cx = intrinsic_txt_params.get("cx", w / 2.0)
             cy = intrinsic_txt_params.get("cy", h / 2.0)
-            model = "SIMPLE_PINHOLE"
+            model = "PINHOLE" if "fy" in intrinsic_txt_params else "SIMPLE_PINHOLE"
             print(f"  [{label}] Intrinsics from txt   : {w}x{h}, "
-                  f"fx={fx:.2f}, fy={fy:.2f}, model=SIMPLE_PINHOLE")
-            return model, fx, fy, cx, cy, 0.0, 0.0, 0.0, 0.0, 0.0, w, h
+                  f"fx={fx:.2f}, fy={fy:.2f}, model={model}")
+            return model, fx, fy, cx, cy, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, w, h
 
-    # -- 3. From .opt file ----------------------------------------------------
+    # -- 2. From .opt file ----------------------------------------------------
     if opt_params and "FocalLength" in opt_params and "SensorSize" in opt_params:
         fl_mm  = opt_params["FocalLength"]
         sensor = opt_params["SensorSize"]
@@ -1194,6 +1198,19 @@ def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fi
                   f"fx={fx:.2f} px  (fl={fl_mm}mm, sensor={sensor}mm)"
                   f"{', model=FULL_OPENCV (distortion)' if has_distortion else ''}")
             return model, fx, fy, cx, cy, k1, k2, p1, p2, k3, 0.0, 0.0, 0.0, w, h
+    # -- 3. From JSON frame --------------------------------------------
+    for fr in frames:
+        if fr.get("fl_x", 0) != 0 and fr.get("w", 0) != 0:
+            w, h   = int(fr["w"]), int(fr["h"])
+            fx, fy = fr["fl_x"], fr.get("fl_y", fr["fl_x"])
+            cx, cy = fr["cx"], fr["cy"]
+            k1 = fr.get("k1", 0.0); k2 = fr.get("k2", 0.0)
+            k3 = fr.get("k3", 0.0)
+            p1 = fr.get("p1", 0.0); p2 = fr.get("p2", 0.0)
+            model = "FULL_OPENCV"
+            print(f"  [{label}] Intrinsics from JSON  : {w}x{h}, "
+                  f"fx={fx:.2f}, fy={fy:.2f}, model=FULL_OPENCV")
+            return model, fx, fy, cx, cy, k1, k2, p1, p2, k3, 0.0, 0.0, 0.0, w, h
     print(f"       JSON frames: {len(frames)}, first has fl_x={frames[0].get('fl_x',0)}")
     print(f"       intrinsic.txt: {intrinsic_txt_params}")
     print(f"       .opt file: {dict(opt_params) if opt_params else 'not found'}")
@@ -1210,7 +1227,9 @@ def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fi
 
 def cameras_line(cam_id, model, w, h, fx, fy, cx, cy, k1, k2, p1, p2, k3, k4=None, k5=0.0, k6=0.0):
     """One cameras.txt entry."""
-    if model == "SIMPLE_PINHOLE":
+    if model == "PINHOLE":
+        return f"{cam_id} {model} {w} {h} {fx:.8f} {fy:.8f} {cx:.8f} {cy:.8f}\n"
+    elif model == "SIMPLE_PINHOLE":
         return f"{cam_id} {model} {w} {h} {fx:.8f} {cx:.8f} {cy:.8f}\n"
     elif model == "SIMPLE_RADIAL":
         return f"{cam_id} {model} {w} {h} {fx:.8f} {cx:.8f} {cy:.8f} {k1:.8f}\n"
