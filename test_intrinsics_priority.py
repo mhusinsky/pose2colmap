@@ -81,6 +81,10 @@ class IntrinsicsPriorityTests(unittest.TestCase):
             "1 PINHOLE 4000 3000 1500.00000000 1490.00000000 2000.00000000 1000.00000000\n",
         )
 
+    def test_resolve_intrinsics_empty_frames_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            resolve_intrinsics([], {}, {}, fisheye=False)
+
 
 if __name__ == "__main__":
     unittest.main()

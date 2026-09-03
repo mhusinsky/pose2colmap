@@ -1211,7 +1211,10 @@ def resolve_intrinsics(frames, intrinsic_txt_params, opt_params, label="cam", fi
             print(f"  [{label}] Intrinsics from JSON  : {w}x{h}, "
                   f"fx={fx:.2f}, fy={fy:.2f}, model=FULL_OPENCV")
             return model, fx, fy, cx, cy, k1, k2, p1, p2, k3, 0.0, 0.0, 0.0, w, h
-    print(f"       JSON frames: {len(frames)}, first has fl_x={frames[0].get('fl_x',0)}")
+    if frames:
+        print(f"       JSON frames: {len(frames)}, first has fl_x={frames[0].get('fl_x',0)}")
+    else:
+        print("       JSON frames: 0")
     print(f"       intrinsic.txt: {intrinsic_txt_params}")
     print(f"       .opt file: {dict(opt_params) if opt_params else 'not found'}")
     raise ValueError(
