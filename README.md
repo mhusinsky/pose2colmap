@@ -27,6 +27,24 @@ Add laspy only if you're working with .las point clouds. For your QW_Ramp run (u
 # User Manual
 please see attached user manual txt file for details.
 
+# Undistorted S20 calibration notes
+
+For SHARE S20 undistorted exports, keep and pass the post-undistortion intrinsic files:
+- `left_undistort_intrinsic.txt`
+- `right_undistort_intrinsic.txt` (or `...intrinsics.txt`)
+
+In non-fisheye mode, `pose2colmap.py` now resolves intrinsics in this order:
+1. `*_undistort_intrinsic.txt`
+2. `*.opt`
+3. `TransformedCam.json` (fallback)
+
+When `fx` and `fy` are available, `cameras.txt` is written with COLMAP `PINHOLE` (`FX FY CX CY`).
+
+Example:
+```bash
+python pose2colmap.py --folder "H:/my_scan/Output/Undistort" --viewer-conventions=LFS
+```
+
 # Additional Files:
 batch_resize_undistort.py
 =========================
@@ -85,4 +103,3 @@ GUI for sparse files from XGRIDS Developer_data conversion from .bin to .txt
 
 
      
-
